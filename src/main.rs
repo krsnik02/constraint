@@ -1,28 +1,15 @@
-use constraint::{Constraint, Term};
+use constraint::Constraint;
+use syntax::{Term, parse_term};
 
 pub mod constraint;
+pub mod syntax;
 
 fn main() {
-    let term = Box::new(Term::Lam(
-        // \x.
-        Box::new(Term::Lam(
-            // \y. 
-            Box::new(Term::Lam(
-                // \z.
-                Box::new(Term::App(
-                    Box::new(Term::App(
-                        Box::new(Term::Var(2)),
-                        Box::new(Term::Var(0)),
-                    )),
-                    Box::new(Term::App(
-                        Box::new(Term::Var(1)),
-                        Box::new(Term::Var(0)),
-                    )),
-                ))
-            ))
-        ))
-    ));
-    let constraint = Constraint::new(*term);
+    let choice = parse_term("(λ(x) λ(y) x : ∀(a) ∀(b ≤ a → a) a → b)").unwrap();
+    let id = parse_term("let s = λ(x) λ(y) λ(z) x z (y z) in let k = λ(x) λ(y) x in s k k").unwrap();
+    let term = Term::Apply(Box::new(choice), Box::new(id));
+    println!("{:?}", term);
+    let constraint = Constraint::new(term);
 
     constraint.write_dot(std::io::stdout()).unwrap();
 

@@ -1,138 +1,186 @@
 use std::{ptr::NonNull, collections::HashSet, io::Write};
-
-pub enum Term {
-    Var(usize),
-    App(Box<Term>, Box<Term>),
-    Lam(Box<Term>), // binder
-}
+use crate::syntax;
 
 pub struct Constraint {
     root: NonNull<GenNode>,
 }
 
 impl Constraint {
-    pub fn new(term: Term) -> Constraint {
-        fn with_vars(term: Term, vars: &mut Vec<NonNull<TyNode>>) -> Constraint {
-            match term {
-                Term::Var(id) => {
-                    let ty = vars[vars.len() - 1 - id]; 
-                    let root = GenNode::new(ty);
-                    Constraint { root }
-                }
-                Term::App(fun, arg) => {
-                    let arg_ty = TyNode::new_bottom();
-                    let ret_ty = TyNode::new_bottom();
-                    let fun_ty = TyNode::new_arrow(arg_ty, ret_ty);
-
-                    let fun = with_vars(*fun, vars);
-                    let arg = with_vars(*arg, vars);
-                    TyNode::constrain(fun_ty, fun.root);
-                    TyNode::constrain(arg_ty, arg.root);
-
-                    let root = GenNode::new(ret_ty);
-                    let binder = Binder { flag: BindingFlag::Flexible, node: NodePtr::Gen(root) };
-                    GenNode::bind(fun.root, root);
-                    GenNode::bind(arg.root, root);
-                    TyNode::bind(fun_ty, binder);
-                    TyNode::bind(arg_ty, binder);
-                    TyNode::bind(ret_ty, binder);
-
-                    Constraint { root }
-                }
-                Term::Lam(body) => {
-                    let arg_ty = TyNode::new_bottom();
-                    let ret_ty = TyNode::new_bottom();
-                    let fun_ty = TyNode::new_arrow(arg_ty, ret_ty);
-
-                    vars.push(arg_ty);
-                    let body = with_vars(*body, vars);
-                    vars.pop();
-                    TyNode::constrain(ret_ty, body.root);
-
-                    let root = GenNode::new(fun_ty);
-                    let binder = Binder { flag: BindingFlag::Flexible, node: NodePtr::Gen(root) };
-                    GenNode::bind(body.root, root);
-                    TyNode::bind(fun_ty, binder);
-                    TyNode::bind(arg_ty, binder);
-                    TyNode::bind(ret_ty, binder);
-
-                    Constraint { root }
-                }
-            }
-        }
-        with_vars(term, &mut Vec::new())
+    pub fn new(term: syntax::Term) -> Constraint {
+        ConstraintBuilder::new().build(term)
     }
 
+    pub fn write_dot(&self, w: impl Write) -> Result<(), std::io::Error> {
+        DotWriter::new(w).write(self.root)
+    }
+}
 
-    pub fn write_dot(&self, mut w: impl Write) -> Result<(), std::io::Error> {
-        fn visit_gen(
-            gen: NonNull<GenNode>, 
-            w: &mut impl Write,
-            visited_gen: &mut HashSet<NonNull<GenNode>>,
-            visited_ty: &mut HashSet<NonNull<TyNode>>,
-        ) -> Result<(), std::io::Error> {
-            if !visited_gen.insert(gen) { return Ok(()) }
-            let r = unsafe { gen.as_ref() };
+enum Edge {
+    Unif(NonNull<TyNode>),
+    Inst(NonNull<GenNode>),
+}
 
-            writeln!(w, "    gen_{0:?} [label=\"{0:?}\", shape=rect]", gen)?;
-            r.bound.iter().try_for_each(|ptr| match *ptr {
-                NodePtr::Gen(node) => visit_gen(node, w, visited_gen, visited_ty),
-                NodePtr::Ty(node) => visit_ty(node, w, visited_ty),
-            })?;
+struct ConstraintBuilder {
+    vars: Vec<Edge>,
+}
 
-            writeln!(w, "    gen_{:?} -> ty_{:?} [dir=none]", gen, r.ty)?;
-            if let Some(binder) = r.binder {
-                writeln!(w, "    gen_{:?} -> gen_{:?} [style=dotted dir=back]", binder, gen)?;
+impl ConstraintBuilder {
+    fn new() -> ConstraintBuilder {
+        ConstraintBuilder { vars: Vec::new() }
+    }
+
+    fn build(&mut self, term: syntax::Term) -> Constraint {
+        match term {
+            syntax::Term::Var(id) => self.variable(id),
+            syntax::Term::Apply(fun, arg) => self.apply(*fun, *arg),
+            syntax::Term::Lambda(_, body) => self.lambda(*body),
+            syntax::Term::Let(_, value, body) => self.let_expr(*value, *body),
+            syntax::Term::Coerce(ty) => self.coerce(*ty),
+        }
+    }
+
+    fn variable(&mut self, id: usize) -> Constraint {
+        let root = match self.vars[self.vars.len() - 1 - id] {
+            Edge::Unif(ty) => GenNode::new(ty),
+            Edge::Inst(gen) => {
+                let var = TyNode::new_bottom();
+                let root = GenNode::new(var);
+                TyNode::bind(var, Binder { flag: BindingFlag::Flexible, node: NodePtr::Gen(root) });
+                TyNode::constrain(var, gen);
+                root
             }
+        };
+        Constraint { root }
+    }
+    
+    fn apply(&mut self, fun: syntax::Term, arg: syntax::Term) -> Constraint {
+        let arg_ty = TyNode::new_bottom();
+        let ret_ty = TyNode::new_bottom();
+        let fun_ty = TyNode::new_arrow(arg_ty, ret_ty);
+        let fun = self.build(fun);
+        let arg = self.build(arg);
+        TyNode::constrain(fun_ty, fun.root);
+        TyNode::constrain(arg_ty, arg.root);
+        let root = GenNode::new(ret_ty);
+        let binder = Binder { flag: BindingFlag::Flexible, node: NodePtr::Gen(root) };
+        GenNode::bind(fun.root, root);
+        GenNode::bind(arg.root, root);
+        TyNode::bind(fun_ty, binder);
+        TyNode::bind(arg_ty, binder);
+        TyNode::bind(ret_ty, binder);
+        Constraint { root }
+    }
 
-            r.constrains.iter().try_for_each(|ptr|
-                writeln!(w, "    gen_{:?} -> ty_{:?} [color=\"red:red\" style=dashed arrowhead=veevee]", gen, ptr)
-            )?;
+    fn lambda(&mut self, body: syntax::Term) -> Constraint {
+        let arg_ty = TyNode::new_bottom();
+        let ret_ty = TyNode::new_bottom();
+        let fun_ty = TyNode::new_arrow(arg_ty, ret_ty);
+        self.vars.push(Edge::Unif(arg_ty));
+        let body = self.build(body);
+        self.vars.pop();
+        TyNode::constrain(ret_ty, body.root);
+        let root = GenNode::new(fun_ty);
+        let binder = Binder { flag: BindingFlag::Flexible, node: NodePtr::Gen(root) };
+        GenNode::bind(body.root, root);
+        TyNode::bind(fun_ty, binder);
+        TyNode::bind(arg_ty, binder);
+        TyNode::bind(ret_ty, binder);
+        Constraint { root }
+    }
 
-            Ok(())
+    fn let_expr(&mut self,value: syntax::Term, body: syntax::Term) -> Constraint {
+        let var = TyNode::new_bottom();
+        let root = GenNode::new(var);
+        TyNode::bind(var, Binder { flag: BindingFlag::Flexible, node: NodePtr::Gen(root) });
+        let val = self.build(value);
+        self.vars.push(Edge::Inst(val.root));
+        let body = self.build(body);
+        self.vars.pop();
+        GenNode::bind(val.root, root);
+        GenNode::bind(body.root, root);
+        TyNode::constrain(var, body.root);
+        Constraint { root }
+    }
+
+    fn coerce(&mut self, ty: syntax::Type) -> Constraint {
+        let arg = Type::new(ty.clone());
+        let ret = Type::new(ty);
+        let fun = TyNode::new_arrow(arg.root, ret.root);
+        let root = GenNode::new(fun);
+        TyNode::bind(arg.root, Binder { flag: BindingFlag::Rigid, node: NodePtr::Gen(root) });
+        TyNode::bind(ret.root, Binder { flag: BindingFlag::Flexible, node: NodePtr::Gen(root) });
+        TyNode::bind(fun, Binder { flag: BindingFlag::Flexible, node: NodePtr::Gen(root) });
+        Constraint { root }
+    }
+}
+
+
+struct DotWriter<W> {
+    w: W,
+    visited_gen: HashSet<NonNull<GenNode>>,
+    visited_ty: HashSet<NonNull<TyNode>>,
+}
+
+impl<W: Write> DotWriter<W> {
+    fn new(w: W) -> DotWriter<W> {
+        DotWriter { w, visited_gen: HashSet::new(), visited_ty: HashSet::new() }
+    }
+
+    fn visit_gen(&mut self, gen: NonNull<GenNode>) -> Result<(), std::io::Error> {
+        if !self.visited_gen.insert(gen) { return Ok(()) }
+        let r = unsafe { gen.as_ref() };
+        writeln!(self.w, "    gen_{0:?} [label=\"{0:?}\", shape=rect]", gen)?;
+        r.bound.iter().try_for_each(|ptr| match *ptr {
+            NodePtr::Gen(node) => self.visit_gen(node),
+            NodePtr::Ty(node) => self.visit_ty(node),
+        })?;
+
+        writeln!(self.w, "    gen_{:?} -> ty_{:?} [dir=none]", gen, r.ty)?;
+        if let Some(binder) = r.binder {
+            writeln!(self.w, "    gen_{:?} -> gen_{:?} [style=dotted dir=back]", binder, gen)?;
+        }
+        r.constrains.iter().try_for_each(|ptr|
+            writeln!(self.w, "    gen_{:?} -> ty_{:?} [color=\"red:red\" style=dashed arrowhead=veevee]", gen, ptr)
+        )?;
+        Ok(())
+    }        
+    
+    fn visit_ty(&mut self, ty: NonNull<TyNode>) -> Result<(), std::io::Error> {
+        if !self.visited_ty.insert(ty) { return Ok(()) }
+        let r = unsafe { ty.as_ref() };
+
+        match r.structure {
+            Structure::Arrow(arg, ret) => {
+                self.visit_ty(arg)?;
+                self.visit_ty(ret)?;
+                writeln!(self.w, "    ty_{0:?} [label=\"\u{2192}\\n{0:?}\"]", ty)?;
+                writeln!(self.w, "    ty_{:?}:sw -> ty_{:?} [dir=none]", ty, arg)?;
+                writeln!(self.w, "    ty_{:?}:se -> ty_{:?} [dir=none]", ty, ret)?;
+            }
+            Structure::Bottom => writeln!(self.w, "    ty_{0:?} [label=\"\u{22a5}\\n{0:?}\"]", ty)?
         }
 
-        fn visit_ty(
-            ty: NonNull<TyNode>,
-            w: &mut impl Write,
-            visited_ty: &mut HashSet<NonNull<TyNode>>,
-        ) -> Result<(), std::io::Error> {
-            if !visited_ty.insert(ty) { return Ok(()) }
-            let r = unsafe { ty.as_ref() };
-
-            match r.structure {
-                Structure::Arrow(arg, ret) => {
-                    visit_ty(arg, w, visited_ty)?;
-                    visit_ty(ret, w, visited_ty)?;
-                    writeln!(w, "    ty_{0:?} [label=\"\u{2192}\\n{0:?}\"]", ty)?;
-                    writeln!(w, "    ty_{:?}:sw -> ty_{:?} [dir=none]", ty, arg)?;
-                    writeln!(w, "    ty_{:?}:se -> ty_{:?} [dir=none]", ty, ret)?;
+        if let Some(binder) = r.binder {
+            let style = match binder.flag {
+                BindingFlag::Flexible => "dotted",
+                BindingFlag::Rigid => "dashed",
+            };
+            match binder.node {
+                NodePtr::Gen(binder) => {
+                    writeln!(self.w, "    gen_{:?} -> ty_{:?} [style={} dir=back]", binder, ty, style)?
                 }
-                Structure::Bottom => writeln!(w, "    ty_{0:?} [label=\"\u{22a5}\\n{0:?}\"]", ty)?
-            }
-
-            if let Some(binder) = r.binder {
-                let style = match binder.flag {
-                    BindingFlag::Flexible => "dotted",
-                    BindingFlag::Rigid => "dashed",
-                };
-                match binder.node {
-                    NodePtr::Gen(binder) => {
-                        writeln!(w, "    gen_{:?} -> ty_{:?} [style={} dir=back]", binder, ty, style)?
-                    }
-                    NodePtr::Ty(binder) => {
-                        writeln!(w, "    ty_{:?} -> ty_{:?} [style={} dir=back]", binder, ty, style)?
-                    }
+                NodePtr::Ty(binder) => {
+                    writeln!(self.w, "    ty_{:?} -> ty_{:?} [style={} dir=back]", binder, ty, style)?
                 }
             }
-
-            Ok(())
         }
+        Ok(())
+    }
 
-
-        writeln!(w, "digraph {{")?;
-        visit_gen(self.root, &mut w, &mut HashSet::new(), &mut HashSet::new())?;
-        writeln!(w, "}}")
+    fn write(&mut self, constraint: NonNull<GenNode>) -> Result<(), std::io::Error> {
+        writeln!(self.w, "digraph {{")?;
+        self.visit_gen(constraint)?;
+        writeln!(self.w, "}}")
     }
 }
 
@@ -164,6 +212,33 @@ impl GenNode {
 
 pub struct Type {
     root: NonNull<TyNode>,
+}
+
+impl Type {
+    pub fn new(ty: syntax::Type) -> Type {
+        fn with_vars(ty: syntax::Type, vars: &mut Vec<NonNull<TyNode>>) -> NonNull<TyNode> {
+            match ty {
+                syntax::Type::Var(id) => vars[vars.len() - 1 - id],
+                syntax::Type::Arrow(arg, ret) => {
+                    let arg = with_vars(*arg, vars);
+                    let ret = with_vars(*ret, vars);
+                    TyNode::new_arrow(arg, ret)
+                },
+                syntax::Type::Forall(_, ty, body) => {
+                    let bound = match ty {
+                        Some(ty) => with_vars(*ty, vars),
+                        None => TyNode::new_bottom(),
+                    };
+                    vars.push(bound);
+                    let root = with_vars(*body, vars);
+                    vars.pop();
+                    TyNode::bind(bound, Binder { flag: BindingFlag::Flexible, node: NodePtr::Ty(root) });
+                    root
+                },
+            }
+        }
+        Type { root: with_vars(ty, &mut Vec::new()) }
+    }
 }
 
 pub(crate) struct TyNode {
