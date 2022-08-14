@@ -130,10 +130,12 @@ impl<W: Write> DotWriter<W> {
         if !self.visited_gen.insert(gen) { return Ok(()) }
         let r = unsafe { gen.as_ref() };
         writeln!(self.w, "    gen_{0:?} [label=\"{0:?}\", shape=rect]", gen)?;
-        r.bound.iter().try_for_each(|ptr| match *ptr {
-            NodePtr::Gen(node) => self.visit_gen(node),
-            NodePtr::Ty(node) => self.visit_ty(node),
-        })?;
+        for ptr in r.bound.iter() {
+            match *ptr {
+                NodePtr::Gen(node) => self.visit_gen(node)?, 
+                NodePtr::Ty(node) => self.visit_ty(node)?,
+            }
+        }
 
         writeln!(self.w, "    gen_{:?} -> ty_{:?} [dir=none]", gen, r.ty)?;
         if let Some(binder) = r.binder {
@@ -148,16 +150,16 @@ impl<W: Write> DotWriter<W> {
     fn visit_ty(&mut self, ty: NonNull<TyNode>) -> Result<(), std::io::Error> {
         if !self.visited_ty.insert(ty) { return Ok(()) }
         let r = unsafe { ty.as_ref() };
-
         match r.structure {
             Structure::Arrow(arg, ret) => {
-                self.visit_ty(arg)?;
-                self.visit_ty(ret)?;
                 writeln!(self.w, "    ty_{0:?} [label=\"\u{2192}\\n{0:?}\"]", ty)?;
                 writeln!(self.w, "    ty_{:?}:sw -> ty_{:?} [dir=none]", ty, arg)?;
                 writeln!(self.w, "    ty_{:?}:se -> ty_{:?} [dir=none]", ty, ret)?;
             }
             Structure::Bottom => writeln!(self.w, "    ty_{0:?} [label=\"\u{22a5}\\n{0:?}\"]", ty)?
+        }
+        for ptr in r.bound.iter() {
+            self.visit_ty(*ptr)?;
         }
 
         if let Some(binder) = r.binder {

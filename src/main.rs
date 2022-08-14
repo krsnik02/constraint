@@ -10,7 +10,5 @@ fn main() {
     let term = Term::Apply(Box::new(choice), Box::new(id));
     println!("{:?}", term);
     let constraint = Constraint::new(term);
-
     constraint.write_dot(std::io::stdout()).unwrap();
-
 }
